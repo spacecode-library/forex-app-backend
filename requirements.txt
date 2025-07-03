@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[aio]      # or "sqlalchemy" + "asyncpg"
+asyncpg
+pydantic
+python-jose[cryptography]   # for JWT
+passlib[bcrypt]             # for password hashing (if needed)
+python-dotenv               # optional, for loading env vars
+websockets                  # WebSocket support
