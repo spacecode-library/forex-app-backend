@@ -42,6 +42,7 @@ class PositionResponse(BaseModel):
     unrealized_pnl: float
     open_time: datetime
     status:str
+    stop_loss: Optional[float] = None
 
 class PriceUpdate(BaseModel):
     symbol: str
