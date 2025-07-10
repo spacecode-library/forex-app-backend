@@ -686,7 +686,9 @@ class PriceService:
                     
                     # Calculate P&L based on symbol specifications
                     point_value = self._get_point_value(symbol)
-                    unrealized_pnl = price_diff * trade.volume * 1000 * point_value
+                    contract_size = await self.get_contract_size(symbol)
+
+                    unrealized_pnl = price_diff * trade.volume * contract_size * point_value
                     
                     # Calculate pips from user's perspective
                     pips = self._calculate_pips(symbol, trade.entry_price, current_price, trade.user_type.value)
@@ -860,3 +862,14 @@ class PriceService:
             "last_update": self.last_position_cache_update.isoformat(),
             "cache_age_seconds": (datetime.now() - self.last_position_cache_update).total_seconds()
         }
+    async def get_contract_size(self, symbol: str) -> float:
+            """
+            Get contract size for different symbols.
+            """
+            contract_sizes = {
+                "EURUSD": 100000,
+                "USDJPY": 100000,
+                "XAUUSD": 100,  # Gold is typically 100 oz per lot
+                # Add more symbols as needed
+            }
+            return contract_sizes.get(symbol, 100000)  

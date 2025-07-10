@@ -78,8 +78,8 @@ from sqlalchemy import select
 from database import get_database
 from models.user import User
 from auth.jwt_handler import verify_token
-from services.price_service import PriceService
-from services.trade_service import TradeService
+from services.price_service import PriceService 
+from services.trade_service import TradeService,MarginCallService
 
 security = HTTPBearer()
 
@@ -109,3 +109,7 @@ def get_price_service(request: Request) -> PriceService:
 
 def get_trade_service(request: Request) -> TradeService:
     return request.app.state.trade_service
+
+def get_margin_service(request: Request) -> MarginCallService:
+    """Get margin service from app state"""
+    return request.app.state.margin_service

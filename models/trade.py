@@ -30,6 +30,7 @@ class Trade(Base):
     order_type = Column(SQLEnum(OrderType), nullable=False)
     user_type = Column(SQLEnum(TradeType), nullable=False)  # What user sees
     exec_type = Column(SQLEnum(TradeType), nullable=False)  # What actually executes (reversed)
+    margin_required = Column(Float, nullable=True) 
     volume = Column(Float, nullable=False)
     profit = Column(Float, default=0.0)
     status = Column(SQLEnum(TradeStatus), default=TradeStatus.PENDING)
@@ -40,5 +41,8 @@ class Trade(Base):
     open_time = Column(DateTime(timezone=True), server_default=func.now())
     close_time = Column(DateTime(timezone=True))
     is_fake = Column(Boolean, nullable=False)  # Record if this was fake execution
+    gross_profit = Column(Float, nullable=True)  # NEW: Profit before commission
+    commission = Column(Float, default=0.0)      
     
     user = relationship("User", back_populates="trades")
+

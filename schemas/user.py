@@ -70,6 +70,7 @@ class UserUpdate(BaseModel):
     first_name: Optional[str] = Field(None, min_length=1, max_length=50)
     last_name: Optional[str] = Field(None, min_length=1, max_length=50)
     balance: Optional[float] = Field(None, ge=0)
+    leverage: Optional[int] = Field(None, ge=1, le=1000, description="Trading leverage (1-1000)")  # NEW
     is_fake: Optional[bool] = None
     is_active: Optional[bool] = None
 
@@ -154,10 +155,41 @@ class FinancialStats(BaseModel):
     demo_profit: float
     total_user_balance: float
 
+
+class LeverageUpdate(BaseModel):
+    leverage: int = Field(..., ge=1, le=1000, description="Leverage ratio (1-1000)")
+    
+    @field_validator('leverage')
+    def validate_leverage(cls, v):
+        if v < 1 or v > 1000:
+            raise ValueError('Leverage must be between 1 and 1000')
+        return v
+
+
+class LeverageResponse(BaseModel):
+    user_id: UUID4
+    username: str
+    leverage: int
+    updated_at: datetime
+    updated_by: str  # Admin username who made the change
+
+class BulkLeverageUpdate(BaseModel):
+    user_ids: List[UUID4] = Field(..., max_items=100, description="List of user IDs (max 100)")
+    leverage: int = Field(..., ge=1, le=1000, description="Leverage ratio to apply")
+
+class LeverageStats(BaseModel):
+    leverage_distribution: List[dict]
+    average_leverage: float
+    min_leverage: int
+    max_leverage: int
+    total_active_users: int
+
+
 class AdminDashboardResponse(BaseModel):
     users: UserStats
     trades: TradingStats
     financials: FinancialStats
+    leverage: LeverageStats
     system_status: dict = {
         "status": "operational",
         "version": "1.0.0",

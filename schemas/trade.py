@@ -28,6 +28,8 @@ class TradeResponse(BaseModel):
     open_time: datetime
     close_time: Optional[datetime]
     unrealized_pnl: Optional[float] = None
+    gross_profit: Optional[float] = None    # NEW
+    commission: Optional[float] = None      # NEW
     
     class Config:
         from_attributes = True
@@ -40,12 +42,15 @@ class PositionResponse(BaseModel):
     entry_price: float
     current_price: float
     unrealized_pnl: float
+    margin_required: Optional[float] = None 
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
     open_time: datetime
     status:str
-    stop_loss: Optional[float] = None
 
 class PriceUpdate(BaseModel):
     symbol: str
     bid: float
     ask: float
     timestamp: datetime
+

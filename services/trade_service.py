@@ -884,7 +884,7 @@ from models.user import User
 from schemas.trade import TradeCreate, PositionResponse
 from services.mt5_service import MT5Service
 from services.price_service import PriceService
-
+from fastapi import HTTPException, status
 logger = logging.getLogger(__name__)
 
 class TradeService:
@@ -895,15 +895,28 @@ class TradeService:
         self.commission_per_lot = 6.0  # $6 commission per lot
     
     async def place_trade(self, db: AsyncSession, user: User, trade_data: TradeCreate) -> Trade:
-        """Place a new trade with correct limit order and commission support"""
+        """
+        Place a new trade with leverage-based margin calculation.
+        """
         # Generate unique ticket
         ticket = str(uuid.uuid4())[:8].upper()
         
         # Reverse the execution type (user buys, we sell to market)
         exec_type = TradeType.SELL if trade_data.user_type == TradeType.BUY else TradeType.BUY
         
+        # Calculate margin using user's leverage
+        margin_required = await self.calculate_margin_required(user, trade_data.symbol, trade_data.volume)
+        
         # Calculate commission
         commission = trade_data.volume * self.commission_per_lot
+        
+        # Check if user has sufficient balance
+        total_required = margin_required + commission
+        if user.balance < total_required:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient balance. Required: ${total_required:.2f} (Margin: ${margin_required:.2f}, Commission: ${commission:.2f}), Available: ${user.balance:.2f}"
+            )
         
         # Create trade record
         trade = Trade(
@@ -914,6 +927,7 @@ class TradeService:
             user_type=trade_data.user_type,
             exec_type=exec_type,
             volume=trade_data.volume,
+            margin_required=margin_required,  # Store margin for reference
             stop_loss=trade_data.stop_loss,
             take_profit=trade_data.take_profit,
             is_fake=user.is_fake,
@@ -922,14 +936,11 @@ class TradeService:
         
         try:
             if trade_data.order_type == OrderType.MARKET:
-                # ✅ FIXED: Execute market order immediately
-                await self._execute_trade_immediately(trade, user, db, commission)
+                await self._execute_trade_immediately(trade, user, db, margin_required, commission)
             else:
-                # ✅ FIXED: Handle limit order - store for monitoring (DON'T execute yet)
                 if not trade_data.price:
                     raise Exception("Limit orders require a price")
-                
-                trade.entry_price = trade_data.price  # Store target price
+                trade.entry_price = trade_data.price
                 await self._validate_and_store_limit_order(trade, user, db, commission)
             
             db.add(trade)
@@ -945,26 +956,34 @@ class TradeService:
             await db.commit()
             raise
     
-    async def _execute_trade_immediately(self, trade: Trade, user: User, db: AsyncSession, commission: float):
-        """Execute market order immediately"""
+    async def _execute_trade_immediately(self, trade: Trade, user: User, db: AsyncSession, margin_required: float, commission: float):
+        """
+        Execute market order immediately with leverage-based margin.
+        """
         try:
             if user.is_fake:
                 await self._execute_fake_trade(trade)
             else:
-                # ✅ FIXED: For real users, send ONLY market order to MT5 (no SL/TP)
                 await self._execute_real_trade(trade)
+
+            if trade.take_profit is not None:
+                # compute how far the user’s requested TP was from their *intended* entry
+                delta = trade.take_profit - trade.entry_price
+                # now rebase it so it sits properly beyond the real fill
+                trade.take_profit = trade.entry_price + delta
             
             # Deduct margin + commission from user balance
-            margin_required = trade.volume * 1000  # Simplified margin calculation
             total_deduction = margin_required + commission
-            
-            if user.balance < total_deduction:
-                raise Exception(f"Insufficient balance. Required: ${total_deduction:.2f}, Available: ${user.balance:.2f}")
-            
             user.balance -= total_deduction
             trade.status = TradeStatus.EXECUTED
+
+            db.add(trade)
+            db.add(user)
+            await db.commit()
+            await db.refresh(trade)
+
             
-            logger.info(f"Market order executed: {trade.ticket}, Commission: ${commission}")
+            logger.info(f"Market order executed: {trade.ticket}, Margin: ${margin_required:.2f} (Leverage: {user.leverage}:1), Commission: ${commission:.2f}")
             
         except Exception as e:
             logger.error(f"Market order execution failed: {e}")
@@ -988,7 +1007,10 @@ class TradeService:
             raise Exception("Sell limit order must be above current market price")
         
         # Check if user has sufficient balance for when order executes
-        margin_required = trade.volume * 1000
+        # margin_required = trade.volume * 1000
+        contract_size = await self.get_contract_size(trade.symbol)
+        current_price = (current_price["bid"] + current_price["ask"]) / 2 
+        margin_required = (trade.volume * contract_size * current_price) / user.leverage
         total_required = margin_required + commission
         
         if user.balance < total_required:
@@ -1033,7 +1055,7 @@ class TradeService:
                     
                     # ✅ Execute the trade immediately (will go to MT5 as market order for real users)
                     commission = trade.volume * self.commission_per_lot
-                    await self._execute_trade_immediately(trade, user, db, commission)
+                    await self._execute_trade_immediately(trade, user, db, trade.margin_required, commission)
                     
                     # Update database
                     await db.commit()
@@ -1044,8 +1066,9 @@ class TradeService:
                     
             except Exception as e:
                 logger.error(f"Error executing limit order {ticket}: {e}")
-                trade.status = TradeStatus.CANCELLED
-                executed_orders.append(ticket)
+                continue
+                # trade.status = TradeStatus.CANCELLED
+                # executed_orders.append(ticket)
         
         # Remove executed/cancelled orders from pending
         for ticket in executed_orders:
@@ -1139,7 +1162,9 @@ class TradeService:
         logger.info(f"Real trade executed: {trade.ticket} at {trade.entry_price} (SL/TP managed internally)")
     
     async def close_trade(self, db: AsyncSession, trade: Trade, auto_close: bool = False, close_reason: str = "Manual") -> Trade:
-        """✅ Close an open trade"""
+        """
+        Close an open trade and release margin.
+        """
         if trade.status != TradeStatus.EXECUTED:
             raise Exception("Trade is not open")
         
@@ -1147,39 +1172,58 @@ class TradeService:
             if trade.is_fake:
                 await self._close_fake_trade(trade)
             else:
-                # ✅ For real users, close position on MT5
                 await self._close_real_trade(trade)
             
-            # Calculate commission for closing
+            # Calculate closing commission
             closing_commission = trade.volume * self.commission_per_lot
             
             # Get user and update balance
             user_result = await db.execute(select(User).where(User.id == trade.users_id))
             user = user_result.scalar_one()
             
-            # ✅ FIXED: Calculate P&L from user's perspective
-            user_pnl = self._calculate_user_pnl(trade)
-            
-            # Store the NET profit (after closing commission)
+            # Calculate P&L from user's perspective
+            user_pnl = await self._calculate_user_pnl(trade)
+            trade.gross_profit = user_pnl
+            trade.commission = closing_commission
             trade.profit = user_pnl - closing_commission
             
             # Release margin and add net profit to balance
-            margin_released = trade.volume * 1000
-            user.balance += margin_released + trade.profit
-            
+            if trade.margin_required is not None:
+                margin_to_release = trade.margin_required
+            else:
+                margin_to_release = await self.calculate_margin_required(user, trade.symbol, trade.volume)
+
+            # Update user balance
+            user.balance += margin_to_release + trade.profit
+
             trade.status = TradeStatus.CLOSED
             trade.close_time = datetime.now()
-            
+
             await db.commit()
             
-            logger.info(f"Trade closed: {trade.ticket}, Net P&L: ${trade.profit:.2f}")
+            logger.info(f"Trade closed: {trade.ticket}, Margin released: ${margin_to_release:.2f}, Net P&L: ${trade.profit:.2f}")
+            if auto_close:
+                close_message = {
+                    "type": "trade_closed",
+                    "data": {
+                        "id": str(trade.id),
+                        "ticket": trade.ticket,
+                        "symbol": trade.symbol,
+                        "reason": close_reason,
+                        "profit": float(trade.profit)
+                    }
+                }
+                # Send to price service for WebSocket broadcast
+                if hasattr(self.price_service, '_broadcast_message'):
+                    await self.price_service._broadcast_message(close_message)
             return trade
             
         except Exception as e:
             logger.error(f"Trade close error: {e}")
             raise
+
     
-    def _calculate_user_pnl(self, trade: Trade) -> float:
+    async def _calculate_user_pnl(self, trade: Trade) -> float:
         """✅ FIXED: Calculate P&L from user's perspective"""
         if not trade.entry_price or not trade.exit_price:
             return 0.0
@@ -1194,7 +1238,8 @@ class TradeService:
         
         # Apply point value based on symbol
         point_value = self._get_point_value(trade.symbol)
-        return price_diff * trade.volume * 1000 * point_value
+        contract_size  = await self.get_contract_size(trade.symbol)
+        return price_diff * trade.volume * contract_size * point_value
     
     def _get_point_value(self, symbol: str) -> float:
         """Get point value for P&L calculations"""
@@ -1260,7 +1305,8 @@ class TradeService:
                     price_diff = trade.entry_price - current_price
                 
                 point_value = self._get_point_value(trade.symbol)
-                unrealized_pnl = price_diff * trade.volume * 1000 * point_value
+                contract_size  = await self.get_contract_size(trade.symbol)
+                unrealized_pnl = price_diff * trade.volume * contract_size * point_value
                 
                 positions.append(PositionResponse(
                     id=trade.id,
@@ -1268,6 +1314,8 @@ class TradeService:
                     user_type=trade.user_type,
                     volume=trade.volume,
                     stop_loss=trade.stop_loss,
+                    take_profit=trade.take_profit,
+                    margin_required=trade.margin_required,
                     entry_price=trade.entry_price,
                     current_price=current_price,
                     unrealized_pnl=unrealized_pnl,
@@ -1276,3 +1324,141 @@ class TradeService:
                 ))
         
         return positions
+    
+
+    async def calculate_margin_required(self, user: User, symbol: str, volume: float) -> float:
+        """
+        Calculate margin required for a trade based on user's leverage.
+        """
+        # Get current price for the symbol
+        price_data = await self.price_service.get_price(symbol)
+        if not price_data:
+            raise Exception(f"No price data available for {symbol}")
+        
+        # Use mid price for margin calculation
+        current_price = (price_data["bid"] + price_data["ask"]) / 2
+        
+        # Calculate contract size based on symbol
+        contract_size = await self.get_contract_size(symbol)
+        
+        # Calculate margin: (Volume * Contract Size * Price) / Leverage
+        margin_required = (volume * contract_size * current_price) / user.leverage
+        
+        return margin_required
+
+    async def get_contract_size(self, symbol: str) -> float:
+            """
+            Get contract size for different symbols.
+            """
+            contract_sizes = {
+                "EURUSD": 100000,
+                "USDJPY": 100000,
+                "XAUUSD": 100,  # Gold is typically 100 oz per lot
+                # Add more symbols as needed
+            }
+            return contract_sizes.get(symbol, 100000)  # Default to 100k for forex
+            
+    async def get_account_info(self, db: AsyncSession, user: User) -> dict:
+            """
+            Get account information including leverage and margin usage.
+            """
+            # Get open positions
+            open_trades = await db.execute(
+                select(Trade).where(
+                    and_(
+                        Trade.users_id == user.id,
+                        Trade.status == TradeStatus.EXECUTED
+                    )
+                )
+            )
+            
+            open_positions = open_trades.scalars().all()
+            
+            # Calculate total margin used
+            total_margin_used = sum(trade.margin_required or 0 for trade in open_positions)
+            
+            # Calculate free margin
+            free_margin = user.balance - total_margin_used
+            
+            # Calculate margin level (balance / margin * 100)
+            margin_level = (user.balance / total_margin_used * 100) if total_margin_used > 0 else 0
+            
+            return {
+                "balance": user.balance,
+                "leverage": user.leverage,
+                "margin_used": total_margin_used,
+                "free_margin": free_margin,
+                "margin_level": margin_level,
+                "open_positions": len(open_positions)
+            }
+    
+
+
+class MarginCallService:
+    """
+    Service to monitor margin levels and send margin calls.
+    """
+    
+    def __init__(self, trade_service: TradeService):
+        self.trade_service = trade_service
+        self.margin_call_threshold = 50.0  # 50% margin level threshold
+        self.margin_stop_out = 20.0  # 20% margin level for automatic stop out
+    
+    async def monitor_margin_levels(self, db: AsyncSession):
+        """
+        Monitor all users' margin levels and take appropriate action.
+        """
+        # Get all users with open positions
+        users_with_positions = await db.execute(
+            select(User).join(Trade).where(
+                and_(
+                    Trade.status == TradeStatus.EXECUTED,
+                    User.is_active == True,
+                    User.is_deleted == False
+                )
+            ).distinct()
+        )
+        
+        for user in users_with_positions.scalars().all():
+            try:
+                account_info = await self.trade_service.get_account_info(db, user)
+                margin_level = account_info["margin_level"]
+                
+                if margin_level <= self.margin_stop_out:
+                    # Automatic stop out - close all positions
+                    await self._execute_stop_out(db, user)
+                elif margin_level <= self.margin_call_threshold:
+                    # Send margin call notification
+                    await self._send_margin_call(db, user, margin_level)
+                    
+            except Exception as e:
+                logger.error(f"Error monitoring margin for user {user.username}: {e}")
+    
+    async def _execute_stop_out(self, db: AsyncSession, user: User):
+        """
+        Close all positions for a user due to insufficient margin.
+        """
+        logger.warning(f"Executing stop out for user {user.username}")
+        
+        # Get all open positions
+        open_trades = await db.execute(
+            select(Trade).where(
+                and_(
+                    Trade.users_id == user.id,
+                    Trade.status == TradeStatus.EXECUTED
+                )
+            )
+        )
+        
+        for trade in open_trades.scalars().all():
+            try:
+                await self.trade_service.close_trade(db, trade, auto_close=True, close_reason="Margin Stop Out")
+            except Exception as e:
+                logger.error(f"Failed to close trade {trade.ticket} during stop out: {e}")
+    
+    async def _send_margin_call(self, db: AsyncSession, user: User, margin_level: float):
+        """
+        Send margin call notification to user.
+        """
+        logger.warning(f"Margin call for user {user.username} - Margin level: {margin_level:.2f}%")
+        # Add your notification logic here (email, SMS, etc.)

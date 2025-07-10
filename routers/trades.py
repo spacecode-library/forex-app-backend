@@ -4,6 +4,7 @@ from sqlalchemy import select, and_, desc
 from typing import List, Optional
 from uuid import UUID
 import logging
+from pydantic import BaseModel
 
 from database import get_database
 from models.user import User
@@ -99,7 +100,7 @@ async def close_trade(
 async def get_trade_history(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_database),
-    limit: int = Query(50, le=100),
+    limit: int = Query(50, le=1000),
     offset: int = Query(0, ge=0)
 ):
     """Get user's trade history"""
@@ -336,3 +337,159 @@ async def get_trading_summary(
     
     logger.info(f"Trading summary for {current_user.username}: {summary}")
     return summary
+
+@router.get("/account", response_model=dict)
+async def get_account_info(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """
+    Get account information including leverage and margin usage.
+    """
+    from main import app
+    trade_service = app.state.trade_service
+    
+    try:
+        account_info = await trade_service.get_account_info(db, current_user)
+        return account_info
+    except Exception as e:
+        logger.error(f"Failed to get account info: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve account information"
+        )
+    
+@router.get("/pending-orders")
+async def get_pending_orders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """Get user's pending limit orders"""
+    from main import app
+    trade_service = app.state.trade_service
+    
+    user_pending = []
+    for ticket, trade in trade_service.pending_limit_orders.items():
+        if trade.users_id == current_user.id:
+            user_pending.append({
+                "id": str(trade.id),
+                "ticket": trade.ticket,
+                "symbol": trade.symbol,
+                "user_type": trade.user_type.value,
+                "volume": float(trade.volume),
+                "target_price": float(trade.entry_price),
+                "stop_loss": float(trade.stop_loss) if trade.stop_loss else None,
+                "take_profit": float(trade.take_profit) if trade.take_profit else None,
+                "status": "PENDING"
+            })
+    
+    return user_pending
+
+
+class TradeUpdateRequest(BaseModel):
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+
+# Add to trades router
+@router.put("/update/{trade_id}")
+async def update_trade(
+    trade_id: UUID,
+    update: TradeUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """Update stop loss and take profit for existing position"""
+    result = await db.execute(
+        select(Trade).where(
+            and_(
+                Trade.id == trade_id,
+                Trade.users_id == current_user.id,
+                Trade.status == TradeStatus.EXECUTED
+            )
+        )
+    )
+    trade = result.scalar_one_or_none()
+    
+    if not trade:
+        raise HTTPException(status_code=404, detail="Position not found")
+    
+    # Update SL/TP
+    if update.stop_loss is not None:
+        trade.stop_loss = update.stop_loss
+    if update.take_profit is not None:
+        trade.take_profit = update.take_profit
+    
+    await db.commit()
+    await db.refresh(trade)
+    
+    return {"message": "Position updated successfully"}
+
+@router.post("/cancel/{trade_id}")
+async def cancel_pending_order(
+    trade_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """Cancel a pending limit order"""
+    from main import app
+    trade_service = app.state.trade_service
+    
+    # Get the trade from database
+    result = await db.execute(
+        select(Trade).where(
+            and_(
+                Trade.id == trade_id,
+                Trade.users_id == current_user.id,
+                Trade.status == TradeStatus.PENDING
+            )
+        )
+    )
+    trade = result.scalar_one_or_none()
+    
+    if not trade:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pending order not found"
+        )
+    
+    try:
+        # Remove from pending in-memory dict
+        if trade.ticket in trade_service.pending_limit_orders:
+            del trade_service.pending_limit_orders[trade.ticket]
+            logger.info(f"Removed pending order {trade.ticket} from monitoring")
+
+        # Update trade status
+        trade.status = TradeStatus.CANCELLED
+
+        # Get user
+        user_result = await db.execute(select(User).where(User.id == current_user.id))
+        user = user_result.scalar_one()
+
+        # Refund both margin and commission
+        margin_refund = trade.margin_required or await trade_service.calculate_margin_required(user, trade.symbol, trade.volume)
+        commission_refund = trade.volume * trade_service.commission_per_lot
+        total_refund = margin_refund + commission_refund
+
+        user.balance += total_refund
+
+        # Update commission in DB
+        trade.commission = 0.0
+
+        await db.commit()
+        await db.refresh(trade)
+
+        logger.info(f"Pending order cancelled: {trade.ticket}, Refunded: ${total_refund:.2f}")
+
+        return {
+            "message": f"Order {trade.ticket} cancelled successfully",
+            "ticket": trade.ticket,
+            "refunded_margin": margin_refund,
+            "refunded_commission": commission_refund,
+            "trade": trade
+        }        
+    except Exception as e:
+        logger.error(f"Failed to cancel order {trade.ticket}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to cancel order"
+        )

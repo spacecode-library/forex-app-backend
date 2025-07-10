@@ -180,6 +180,11 @@ from sqlalchemy import select, func, and_
 from typing import List, Optional
 from uuid import UUID
 import secrets
+from datetime import datetime
+from pydantic import BaseModel, Field , field_validator
+from pydantic import UUID4
+from typing import Optional
+
 
 from database import get_database
 from models.user import User
@@ -190,6 +195,11 @@ from dependencies import get_admin_user
 from config import settings
 
 router = APIRouter()
+
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # ===== INITIAL ADMIN CREATION =====
 
@@ -291,6 +301,57 @@ async def create_additional_admin(
 
 # ===== USER PROFILE MANAGEMENT =====
 
+# @router.post("/users", response_model=UserResponse)
+# async def create_user_profile(
+#     user_data: UserCreate,
+#     admin_user: User = Depends(get_admin_user),
+#     db: AsyncSession = Depends(get_database)
+# ):
+#     """
+#     Create a new user profile (admin only).
+#     This creates login credentials for users.
+#     """
+#     # Check if username already exists
+#     result = await db.execute(select(User).where(User.username == user_data.username))
+#     if result.scalar_one_or_none():
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail="Username already exists"
+#         )
+    
+#     # Validate input data
+#     if len(user_data.username) < 3:
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail="Username must be at least 3 characters long"
+#         )
+    
+#     if len(user_data.password) < 6:
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail="Password must be at least 6 characters long"
+#         )
+    
+#     # Create new user with hashed password
+#     hashed_password = get_password_hash(user_data.password)
+#     new_user = User(
+#         first_name=user_data.first_name,
+#         last_name=user_data.last_name,
+#         username=user_data.username,
+#         hashed_password=hashed_password,
+#         is_admin=user_data.is_admin or False,  # Default to regular user
+#         balance=user_data.balance or 10000.0,  # Default balance
+#         is_fake=user_data.is_fake if user_data.is_fake is not None else True,  # Default to demo
+#         is_active=True
+#     )
+    
+#     db.add(new_user)
+#     await db.commit()
+#     await db.refresh(new_user)
+    
+#     return new_user
+
+
 @router.post("/users", response_model=UserResponse)
 async def create_user_profile(
     user_data: UserCreate,
@@ -298,8 +359,7 @@ async def create_user_profile(
     db: AsyncSession = Depends(get_database)
 ):
     """
-    Create a new user profile (admin only).
-    This creates login credentials for users.
+    Create a new user profile with leverage setting (admin only).
     """
     # Check if username already exists
     result = await db.execute(select(User).where(User.username == user_data.username))
@@ -322,22 +382,25 @@ async def create_user_profile(
             detail="Password must be at least 6 characters long"
         )
     
-    # Create new user with hashed password
+    # Create new user with hashed password and leverage
     hashed_password = get_password_hash(user_data.password)
     new_user = User(
         first_name=user_data.first_name,
         last_name=user_data.last_name,
         username=user_data.username,
         hashed_password=hashed_password,
-        is_admin=user_data.is_admin or False,  # Default to regular user
-        balance=user_data.balance or 10000.0,  # Default balance
-        is_fake=user_data.is_fake if user_data.is_fake is not None else True,  # Default to demo
+        is_admin=user_data.is_admin or False,
+        balance=user_data.balance or 10000.0,
+        leverage=user_data.leverage or settings.DEFAULT_LEVERAGE,  # NEW: Set leverage
+        is_fake=user_data.is_fake if user_data.is_fake is not None else True,
         is_active=True
     )
     
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
+    
+    logger.info(f"Admin {admin_user.username} created new user {new_user.username} with leverage {new_user.leverage}:1")
     
     return new_user
 
@@ -451,6 +514,57 @@ async def list_user_profiles(
     
     return users
 
+# @router.put("/users/{user_id}", response_model=UserResponse)
+# async def update_user_profile(
+#     user_id: UUID,
+#     update_data: UserUpdate,
+#     admin_user: User = Depends(get_admin_user),
+#     db: AsyncSession = Depends(get_database)
+# ):
+#     """
+#     Update user profile settings (admin only).
+#     """
+#     result = await db.execute(select(User).where(User.id == user_id))
+#     user = result.scalar_one_or_none()
+    
+#     if not user:
+#         raise HTTPException(
+#             status_code=status.HTTP_404_NOT_FOUND,
+#             detail="User not found"
+#         )
+    
+#     # Update fields if provided
+#     if update_data.first_name is not None:
+#         user.first_name = update_data.first_name
+#     if update_data.last_name is not None:
+#         user.last_name = update_data.last_name
+#     if update_data.balance is not None:
+#         user.balance = update_data.balance
+#     if update_data.is_fake is not None:
+#         # Check if user has open positions before changing account type
+#         open_trades = await db.execute(
+#             select(Trade).where(
+#                 and_(
+#                     Trade.users_id == user_id,
+#                     Trade.status == TradeStatus.EXECUTED
+#                 )
+#             )
+#         )
+#         if open_trades.scalars().first():
+#             raise HTTPException(
+#                 status_code=status.HTTP_400_BAD_REQUEST,
+#                 detail="Cannot change account type while user has open positions"
+#             )
+#         user.is_fake = update_data.is_fake
+#     if update_data.is_active is not None:
+#         user.is_active = update_data.is_active
+    
+#     await db.commit()
+#     await db.refresh(user)
+    
+#     return user
+
+
 @router.put("/users/{user_id}", response_model=UserResponse)
 async def update_user_profile(
     user_id: UUID,
@@ -459,7 +573,7 @@ async def update_user_profile(
     db: AsyncSession = Depends(get_database)
 ):
     """
-    Update user profile settings (admin only).
+    Update user profile settings including leverage (admin only).
     """
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
@@ -477,6 +591,28 @@ async def update_user_profile(
         user.last_name = update_data.last_name
     if update_data.balance is not None:
         user.balance = update_data.balance
+    
+    # NEW: Handle leverage update
+    if update_data.leverage is not None:
+        # Check if user has open positions before changing leverage
+        open_trades = await db.execute(
+            select(Trade).where(
+                and_(
+                    Trade.users_id == user_id,
+                    Trade.status == TradeStatus.EXECUTED
+                )
+            )
+        )
+        if open_trades.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot change leverage while user has open positions"
+            )
+        
+        old_leverage = user.leverage
+        user.leverage = update_data.leverage
+        logger.info(f"Admin {admin_user.username} changed leverage for user {user.username} from {old_leverage}:1 to {user.leverage}:1")
+    
     if update_data.is_fake is not None:
         # Check if user has open positions before changing account type
         open_trades = await db.execute(
@@ -493,6 +629,7 @@ async def update_user_profile(
                 detail="Cannot change account type while user has open positions"
             )
         user.is_fake = update_data.is_fake
+        
     if update_data.is_active is not None:
         user.is_active = update_data.is_active
     
@@ -658,4 +795,279 @@ async def get_admin_dashboard(
         "financials": {
             "total_user_balance": float(total_balance.scalar() or 0.0)
         }
+    }
+
+
+
+class LeverageUpdate(BaseModel):
+    leverage: int = Field(..., ge=1, le=1000, description="Leverage ratio (1-1000)")
+    
+    @field_validator('leverage')
+    def validate_leverage(cls, v):
+        if v < 1 or v > 1000:
+            raise ValueError('Leverage must be between 1 and 1000')
+        return v
+
+class LeverageResponse(BaseModel):
+    user_id: UUID4
+    username: str
+    leverage: int
+    updated_at: datetime
+    updated_by: str  # Admin username who made the change
+
+class BulkLeverageUpdate(BaseModel):
+    user_ids: List[UUID4] = Field(..., max_items=100, description="List of user IDs (max 100)")
+    leverage: int = Field(..., ge=1, le=1000, description="Leverage ratio to apply")
+
+# ===== LEVERAGE MANAGEMENT ENDPOINTS =====
+
+@router.get("/users/{user_id}/leverage", response_model=LeverageResponse)
+async def get_user_leverage(
+    user_id: UUID,
+    admin_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """
+    Get user's current leverage setting (admin only).
+    """
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    return LeverageResponse(
+        user_id=user.id,
+        username=user.username,
+        leverage=user.leverage,
+        updated_at=user.updated_at or user.created_at,
+        updated_by="System"  # You can track this in a separate field if needed
+    )
+
+@router.put("/users/{user_id}/leverage", response_model=LeverageResponse)
+async def update_user_leverage(
+    user_id: UUID,
+    leverage_data: LeverageUpdate,
+    admin_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """
+    Update user's leverage setting (admin only).
+    """
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Check if user has open positions before changing leverage
+    open_trades = await db.execute(
+        select(Trade).where(
+            and_(
+                Trade.users_id == user_id,
+                Trade.status == TradeStatus.EXECUTED
+            )
+        )
+    )
+    
+    if open_trades.scalars().first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot change leverage while user has open positions. Close all positions first."
+        )
+    
+    # Update leverage
+    old_leverage = user.leverage
+    user.leverage = leverage_data.leverage
+    
+    await db.commit()
+    await db.refresh(user)
+    
+    # Log the change (you can implement proper audit logging later)
+    logger.info(f"Admin {admin_user.username} changed leverage for user {user.username} from {old_leverage}:1 to {user.leverage}:1")
+    
+    return LeverageResponse(
+        user_id=user.id,
+        username=user.username,
+        leverage=user.leverage,
+        updated_at=user.updated_at,
+        updated_by=admin_user.username
+    )
+
+@router.post("/users/bulk-leverage", response_model=List[LeverageResponse])
+async def bulk_update_leverage(
+    bulk_data: BulkLeverageUpdate,
+    admin_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """
+    Update leverage for multiple users at once (admin only).
+    """
+    if len(bulk_data.user_ids) > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot update more than 100 users at once"
+        )
+    
+    updated_users = []
+    failed_users = []
+    
+    for user_id in bulk_data.user_ids:
+        try:
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                failed_users.append({
+                    "user_id": str(user_id),
+                    "error": "User not found"
+                })
+                continue
+            
+            # Check for open positions
+            open_trades = await db.execute(
+                select(Trade).where(
+                    and_(
+                        Trade.users_id == user_id,
+                        Trade.status == TradeStatus.EXECUTED
+                    )
+                )
+            )
+            
+            if open_trades.scalars().first():
+                failed_users.append({
+                    "user_id": str(user_id),
+                    "username": user.username,
+                    "error": "Cannot change leverage while user has open positions"
+                })
+                continue
+            
+            # Update leverage
+            old_leverage = user.leverage
+            user.leverage = bulk_data.leverage
+            
+            updated_users.append(LeverageResponse(
+                user_id=user.id,
+                username=user.username,
+                leverage=user.leverage,
+                updated_at=user.updated_at,
+                updated_by=admin_user.username
+            ))
+            
+            logger.info(f"Admin {admin_user.username} changed leverage for user {user.username} from {old_leverage}:1 to {user.leverage}:1")
+            
+        except Exception as e:
+            failed_users.append({
+                "user_id": str(user_id),
+                "error": str(e)
+            })
+    
+    await db.commit()
+    
+    # Refresh all updated users
+    for response in updated_users:
+        result = await db.execute(select(User).where(User.id == response.user_id))
+        user = result.scalar_one()
+        await db.refresh(user)
+    
+    if failed_users:
+        logger.warning(f"Bulk leverage update completed with errors: {failed_users}")
+    
+    return updated_users
+
+@router.get("/leverage/statistics")
+async def get_leverage_statistics(
+    admin_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """
+    Get leverage statistics across all users (admin only).
+    """
+    # Get leverage distribution
+    result = await db.execute(
+        select(User.leverage, func.count(User.id).label('user_count'))
+        .where(and_(User.is_deleted == False, User.is_active == True))
+        .group_by(User.leverage)
+        .order_by(User.leverage)
+    )
+    
+    leverage_distribution = [
+        {"leverage": row.leverage, "user_count": row.user_count}
+        for row in result.fetchall()
+    ]
+    
+    # Get average leverage
+    avg_result = await db.execute(
+        select(func.avg(User.leverage))
+        .where(and_(User.is_deleted == False, User.is_active == True))
+    )
+    avg_leverage = avg_result.scalar() or 0
+    
+    # Get min/max leverage
+    minmax_result = await db.execute(
+        select(func.min(User.leverage), func.max(User.leverage))
+        .where(and_(User.is_deleted == False, User.is_active == True))
+    )
+    min_leverage, max_leverage = minmax_result.fetchone()
+    
+    return {
+        "leverage_distribution": leverage_distribution,
+        "average_leverage": round(avg_leverage, 2),
+        "min_leverage": min_leverage or 0,
+        "max_leverage": max_leverage or 0,
+        "total_active_users": sum(item["user_count"] for item in leverage_distribution)
+    }
+
+@router.post("/users/{user_id}/reset-leverage")
+async def reset_user_leverage_to_default(
+    user_id: UUID,
+    admin_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_database)
+):
+    """
+    Reset user's leverage to default value (admin only).
+    """
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Check for open positions
+    open_trades = await db.execute(
+        select(Trade).where(
+            and_(
+                Trade.users_id == user_id,
+                Trade.status == TradeStatus.EXECUTED
+            )
+        )
+    )
+    
+    if open_trades.scalars().first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot reset leverage while user has open positions"
+        )
+    
+    old_leverage = user.leverage
+    user.leverage = settings.DEFAULT_LEVERAGE
+    
+    await db.commit()
+    await db.refresh(user)
+    
+    logger.info(f"Admin {admin_user.username} reset leverage for user {user.username} from {old_leverage}:1 to {user.leverage}:1 (default)")
+    
+    return {
+        "message": f"Leverage reset to default ({settings.DEFAULT_LEVERAGE}:1) for user {user.username}",
+        "old_leverage": old_leverage,
+        "new_leverage": user.leverage
     }

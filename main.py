@@ -108,23 +108,50 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from services.price_service import PriceService
-from services.trade_service import TradeService
+from services.trade_service import TradeService , MarginCallService
+from database import create_tables, get_database 
 from database import create_tables
+import asyncio 
+import logging  
+from sqlalchemy import select, and_
+from database import async_session
 
+logger = logging.getLogger(__name__)
 # Initialize services
 price_service = PriceService()
 trade_service = TradeService(price_service)
 
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
 # ✅ FIXED: Set the trade service reference in price service for order monitoring
 price_service.set_trade_service(trade_service)
+from models.trade import Trade, TradeStatus, OrderType
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     await create_tables()
     await price_service.start_price_feed()
+    async with async_session() as db:
+        result = await db.execute(
+            select(Trade).where(
+                and_(
+                    Trade.status == TradeStatus.PENDING,
+                    Trade.order_type == OrderType.LIMIT
+                )
+            )
+        )
+        trades = result.scalars().all()
+        for trade in trades:
+            logger.info(f"✅ Loaded pending: {trade.ticket} - {trade.symbol} - ID: {trade.id}")
+            trade_service.pending_limit_orders[trade.ticket] = trade
+
+
+    margin_task = asyncio.create_task(margin_monitoring_task())
+
     yield
     # Shutdown
+    margin_task.cancel()
     await price_service.mt5_service.disconnect()
 
 app = FastAPI(
@@ -137,7 +164,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -146,6 +173,22 @@ app.add_middleware(
 # Register services on app state
 app.state.price_service = price_service
 app.state.trade_service = trade_service
+margin_service = MarginCallService(trade_service)
+
+async def margin_monitoring_task():
+    while True:
+        try:
+            async for db in get_database():
+                await margin_service.monitor_margin_levels(db)
+                break
+        except Exception as e:
+            logger.error(f"Margin monitoring error: {e}")
+        await asyncio.sleep(30)  # Check every 30 seconds
+
+
+# In your lifespan function, add:
+# margin_task = asyncio.create_task(margin_monitoring_task())
+
 
 # ✅ Import and include routers AFTER setting up app and services
 from routers import auth, users, trades, admin
